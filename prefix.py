@@ -69,7 +69,7 @@ def pick_segments_by_mtime(center_ts, pre_s=5.0, post_s=5.0):
 
 def concat_ts_to_mp4(files, out_mp4):
     """Concatena .ts → .mp4 sem re-encode (copy)."""
-    if not files: 
+    if not files:
         print("[CLIP] sem arquivos .ts")
         return False
     with tempfile.NamedTemporaryFile("w", delete=False) as lst:
@@ -205,15 +205,19 @@ def on_new_sample(sink):
         now = time.time()
         last_event = now
         print("[ALERTA] Objeto suspeito detectado!")
-        # 1) Snapshot
+        # 1) Snapshot (sempre salva e faz upload, mas NÃO manda SQS sozinho)
         snaps_dir = os.path.join(SAVE_DIR, "snapshots")
         os.makedirs(snaps_dir, exist_ok=True)
         snap_name = f"weapon-{int(now)}.jpg"
         snap_path = os.path.join(snaps_dir, snap_name)
+        meta_snap = None
         try:
             cv2.imwrite(snap_path, frame)
+            key_snap = f"{S3_PREFIX}snapshots/{snap_name}"
+            meta_snap = upload_and_confirm(snap_path, key_snap)
         except Exception as e:
             log_err("[SNAP] falha", e)
+            key_snap = None
 
         # 2) Clip ±5s
         time.sleep(POST + 0.7)  # garante que segmentos "depois" fecharam
@@ -222,45 +226,39 @@ def on_new_sample(sink):
         os.makedirs(clips_dir, exist_ok=True)
         clip_name = f"weapon-{int(now)}.mp4"
         out_mp4   = os.path.join(clips_dir, clip_name)
-        ok = concat_ts_to_mp4(segs, out_mp4)
+        ok_clip = concat_ts_to_mp4(segs, out_mp4)
 
-        # 3) Uploads + SQS
-        # (envia pelo menos o snapshot; clipe se existir)
-        media_sent = []
-        # snapshot
-        key_snap = f"{S3_PREFIX}snapshots/{snap_name}"
-        meta_snap = upload_and_confirm(snap_path, key_snap)
-        if meta_snap: media_sent.append(("snapshot", key_snap, meta_snap))
-
-        # clip
         meta_clip = None
         key_clip  = None
-        if ok:
+        if ok_clip:
             key_clip = f"{S3_PREFIX}clips/{clip_name}"
             meta_clip = upload_and_confirm(out_mp4, key_clip)
-            if meta_clip: media_sent.append(("clip", key_clip, meta_clip))
 
-        # payload mínimo + extras
-        train_id = str(uuid.uuid4())
-        base_payload = {
-            "event": "weapon_detected",
-            "train_id": train_id,
-            "camera_id": CAMERA_ID,
-            "bucket": S3_BUCKET,
-            "ts_epoch": int(now),
-            "window": {"pre_s": PRE, "post_s": POST},
-            "codec": CODEC_NAME,
-        }
-
-        # envia 1 msg por mídia (snapshot/clip)
-        for kind, s3_key, meta in media_sent:
-            payload = dict(base_payload)
-            payload.update({
-                "kind": kind,          # snapshot | clip
-                "s3_key": s3_key,      # <-- CAMPO OBRIGATÓRIO
-                "metadata": meta
-            })
+        # 3) SÓ manda SQS se o CLIP foi enviado ao S3
+        if meta_clip is not None:
+            train_id = str(uuid.uuid4())
+            payload = {
+                "event": "weapon_detected",
+                "train_id": train_id,
+                "camera_id": CAMERA_ID,
+                "bucket": S3_BUCKET,
+                "ts_epoch": int(now),
+                "window": {"pre_s": PRE, "post_s": POST},
+                "codec": CODEC_NAME,
+                # info principal: CLIP
+                "kind": "clip",
+                "s3_key": key_clip,
+                "metadata": meta_clip,
+            }
+            # inclui snapshot como extra, se deu certo
+            if meta_snap is not None and key_snap is not None:
+                payload["snapshot"] = {
+                    "s3_key": key_snap,
+                    "metadata": meta_snap
+                }
             send_sqs(payload)
+        else:
+            print("[SQS] NÃO enviado porque o clipe não foi gerado/enviado ao S3.")
 
     return Gst.FlowReturn.OK
 
